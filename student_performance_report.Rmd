@@ -1,0 +1,190 @@
+---
+title: "Student Exam Performance Modeling Project"
+author: "Nayananshu Garai"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+set.seed(2026)
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+required_packages <- c(
+  "readr", "dplyr", "ggplot2", "caret",
+  "ranger", "gbm", "glmnet", "kernlab"
+)
+for (pkg in required_packages) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+    library(pkg, character.only = TRUE)
+  }
+}
+```
+
+# Introduction
+
+This project analyzes the student exam performance dataset to predict `final_exam_score` using demographic, study habit, and engagement features. The goal is to compare multiple supervised learning models and verify whether more advanced methods actually improve out-of-sample prediction quality.
+
+The dataset includes variables related to study time, attendance, assignment completion, prior GPA, and academic subject scores. These variables can provide a strong signal for final exam outcomes and can help describe the factors most associated with student performance.
+
+# Methods and Analysis
+
+## Data preparation
+
+```{r data-prep}
+student_data <- read_csv("student_exam_performance_dataset.csv", show_col_types = FALSE)
+
+categorical_cols <- c(
+  "gender", "parental_education", "family_income", "internet_access",
+  "study_environment", "tutoring"
+)
+
+student_data <- student_data %>%
+  mutate(across(all_of(categorical_cols), as.factor))
+
+# Remove leakage fields derived from exam outcomes.
+model_data <- student_data %>%
+  select(-student_id, -pass_fail, -grade_category)
+
+# Use a holdout test set for final model comparison.
+split_index <- createDataPartition(model_data$final_exam_score, p = 0.8, list = FALSE)
+train_data <- model_data[split_index, ]
+test_data <- model_data[-split_index, ]
+
+summary(model_data$final_exam_score)
+```
+
+`pass_fail` and `grade_category` were removed to avoid target leakage because both are directly derived from overall exam outcomes.
+
+## Exploration
+
+```{r exploration-plot, fig.width=7, fig.height=4.5}
+ggplot(model_data, aes(x = final_exam_score)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  labs(
+    title = "Distribution of Final Exam Score",
+    x = "Final Exam Score",
+    y = "Count"
+  )
+```
+
+## Modeling approach
+
+Five models were trained on the same training split:
+
+1. Linear Regression as a baseline interpretable model.
+2. Elastic Net for regularized linear modeling.
+3. SVM Linear for margin-based regression.
+4. Ranger Random Forest as a nonlinear ensemble model.
+5. GBM as a boosting-based nonlinear model.
+
+In addition, a baseline mean predictor was used to check whether trained models meaningfully outperform a naive benchmark.
+
+```{r model-training}
+cv_control <- trainControl(method = "cv", number = 3)
+
+lm_model <- train(
+  final_exam_score ~ ., data = train_data,
+  method = "lm", trControl = cv_control
+)
+
+elastic_net_model <- train(
+  final_exam_score ~ ., data = train_data,
+  method = "glmnet", trControl = cv_control,
+  tuneLength = 5
+)
+
+svm_linear_model <- train(
+  final_exam_score ~ ., data = train_data,
+  method = "svmLinear", trControl = cv_control,
+  tuneLength = 3
+)
+
+rf_model <- train(
+  final_exam_score ~ ., data = train_data,
+  method = "ranger", trControl = cv_control,
+  tuneLength = 3,
+  num.trees = 300,
+  importance = "impurity"
+)
+
+gbm_model <- train(
+  final_exam_score ~ ., data = train_data,
+  method = "gbm", trControl = cv_control,
+  tuneLength = 3, verbose = FALSE
+)
+
+pred_lm <- predict(lm_model, newdata = test_data)
+pred_elastic_net <- predict(elastic_net_model, newdata = test_data)
+pred_svm_linear <- predict(svm_linear_model, newdata = test_data)
+pred_rf <- predict(rf_model, newdata = test_data)
+pred_gbm <- predict(gbm_model, newdata = test_data)
+pred_baseline <- rep(mean(train_data$final_exam_score), nrow(test_data))
+
+get_metrics <- function(prediction, actual) {
+  metric_vec <- postResample(pred = prediction, obs = actual)
+  tibble(
+    RMSE = unname(metric_vec[["RMSE"]]),
+    Rsquared = unname(metric_vec[["Rsquared"]]),
+    MAE = unname(metric_vec[["MAE"]])
+  )
+}
+
+results <- bind_rows(
+  get_metrics(pred_baseline, test_data$final_exam_score) %>% mutate(model = "Baseline Mean"),
+  get_metrics(pred_lm, test_data$final_exam_score) %>% mutate(model = "Linear Regression"),
+  get_metrics(pred_elastic_net, test_data$final_exam_score) %>% mutate(model = "Elastic Net"),
+  get_metrics(pred_svm_linear, test_data$final_exam_score) %>% mutate(model = "SVM Linear"),
+  get_metrics(pred_rf, test_data$final_exam_score) %>% mutate(model = "Ranger Random Forest"),
+  get_metrics(pred_gbm, test_data$final_exam_score) %>% mutate(model = "GBM")
+) %>%
+  relocate(model) %>%
+  arrange(RMSE)
+
+knitr::kable(results, digits = 3)
+
+best_by_rmse <- results %>% slice(1)
+best_by_mae <- results %>% arrange(MAE) %>% slice(1)
+
+best_by_rmse
+best_by_mae
+```
+
+# Results
+
+```{r results-plot, fig.width=7, fig.height=4.5}
+comparison_df <- tibble(
+  actual = test_data$final_exam_score,
+  linear_regression = pred_lm,
+  elastic_net = pred_elastic_net,
+  svm_linear = pred_svm_linear,
+  ranger_random_forest = pred_rf,
+  gbm = pred_gbm
+)
+
+ggplot(comparison_df, aes(x = actual, y = svm_linear)) +
+  geom_point(alpha = 0.6, color = "darkgreen") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  labs(
+    title = "Best RMSE Model (SVM Linear): Predictions vs Actual",
+    x = "Actual Final Exam Score",
+    y = "Predicted Final Exam Score"
+  )
+```
+
+Model comparison shows that trying multiple models did improve prediction metrics slightly. In this run, `SVM Linear` produced the lowest RMSE, while `Elastic Net` produced the lowest MAE. These improvements are small compared to standard linear regression, which indicates the data pattern is already captured very well by linear structure.
+
+The trained models perform well in absolute terms because they substantially outperform the baseline mean predictor and maintain high $R^2$ on the unseen test set.
+
+# Conclusion
+
+This project demonstrated a supervised learning workflow for student score prediction using multiple models and a baseline benchmark. The final comparison indicates that SVM Linear and Elastic Net are marginally better than plain linear regression on holdout data.
+
+Potential impact includes early identification of students who may need additional academic support. Limitations include potential hidden confounders and the fact that results are based on one random split. Future work can include repeated resampling, stability checks across multiple seeds, and additional feature engineering.
+
+# References
+
+1. Student Exam Performance Dataset from kaggle.
+2. Kuhn, M. (2008). Building Predictive Models in R Using the caret Package. Journal of Statistical Software.
+
